@@ -1,9 +1,9 @@
-use chux
+use ./utils x
 
 var -java = [&]
 
 set -java[edit] = {
-  chux:find_select_edit '*.java'
+  x:find-select-edit '*.java'
 }
 set -java[e] = $-java['edit']
 
