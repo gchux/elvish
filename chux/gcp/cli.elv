@@ -1,67 +1,157 @@
 use str
+use runtime
+use file
 
+var -cmds-json = 'chux/gcp/cli.json'
 
+fn -flagToMethods {|&flag=''|
+  var opt = (conj [] (str:split '=' $flag))[0]
+  var withoutDashes = (str:trim-left $flag '-')
+  var parts = (conj [] (str:split '=' $withoutDashes))
+  var flagName = $parts[0]
+  var isBoolean = (eq (count $parts) (num 1)) 
 
-fn -run-services-newListClient {|&ctx=$nil &utils=[&]|
+  set flag = (make-map [[flag $flag]])
+  set flag[opt] = $opt
+  set flag[name] = $flagName
+  set flag[parts] = $parts
+  set flag[isBoolean] = $isBoolean
+  set flag[withoutDashes] = $withoutDashes
 
-  var services-exec~ = $ctx[exec]
-  var exec~ = {|&raw-flags=[] &flags=[] @args|
-    $services-exec~ &raw-flags=$raw-flags &flags=$flags list $@args
+  var -name = (str:replace '-' '' (str:title $flagName))
+
+  var methods = [&]
+  if $isBoolean {
+    set flag[value] = $false
+    set methods['enable'$-name] = { set flag[value] = $true }
+    set methods['disable'$-name] = { set flag[value] = $false }
+    set methods['toggle'$-name] = { set flag[value] = (not $flag[value]) }
+    set methods['is'$-name] = { put $flag[value] }
+  } else {
+    set flag[values] = $parts[1]
+    set flag[value] = $nil
+    set methods['set'$-name] = {|value| set flag[value] = $value }
+    set methods['get'$-name] = { put $flag[value] }
+  }
+
+  set flag[print] = { pprint (dissoc $flag methods) }
+  set methods['print'$-name] = $flag[print]
+
+  set flag[toString] = {
+    var value = $flag[value]
+    if $value {
+      if $isBoolean { put $true $opt } else { 
+        put $true (str:join '=' [$opt $value]) 
+      }
+    } else { put $false $nil }
+  }
+
+  set flag[methods] = $methods
+
+  put $flag
+}
+
+fn -newClient {|&ctx=[&] &command=[&] &exec~={ fail 'unavailable' }|
+  var flags = []
+
+  if (has-key $command _flags_) { 
+    set flags = $command[_flags_] 
   }
 
   var methods = [&]
+  var -flags = [&]
+  
+  each {|flag|
+    var -flag = ($-flagToMethods~ &flag=$flag)
+    set -flags[$-flag[name]] = $-flag
+    var -methods = $-flag[methods]
+    each {|method|
+      set methods[$method] = $-methods[$method]
+    } (conj [] (keys $-methods))
+  } $flags
+  
+  set methods[-printFlags] = {
+    each {|flag|
+      $-flags[$flag][print]
+    } (conj [] (keys $-flags))
+  }
+  
+  var -exec~ = {
+    var flags = []
+    each {|name|
+      var -flag = $-flags[$name]
+      var use flag = ($-flag[toString])
+      if $use {
+        set flags = (conj $flags $flag)
+      }
+    } (conj [] (keys $-flags))
+    $exec~ &flags=$flags
+  }
 
-  set methods[exec] = $exec~ 
-  set methods[-] = $methods[exec]
+  set methods[-] = $-exec~
+  set methods[run] = $-exec~
+  set methods[exec] = $-exec~
   
   put (ns $methods)
 }
 
-fn -run {|&cli=$nil &utils=[&]|
+fn -addCommand {|&ctx=[&] &namespace=[] &commands=[&] &command=[&]|
+  var commandName = $command[_name_]
 
-  var properties = (make-map [
-    [ctx $cli]
-  ])
-  var services = [&]
-
-  var cli-exec~ = $cli[exec]
-  var exec~ = {|&raw-flags=[] &flags=[] @args|
-    $cli-exec~ &raw-flags=$raw-flags &flags=$flags services $@args
+  var -exec~ = $ctx[exec];
+  var exec~ = {|&flags=[] &raw-flags=[] @args|
+    var -namespace = (conj $namespace $commandName)
+    $-exec~ &flags=$flags &raw-flags=$raw-flags $@-namespace $@args
   }
 
-  set services[list] = {|@args|
-   $exec~ list $@args
-  }
-  set services[ls] = $services[list]
+  set commands[$commandName] = $exec~
+  set commands[$commandName'-new'] = ($-newClient~ &ctx=$ctx &command=$command &exec~=$exec~)
 
-  var -services = (make-map [
-    [properties $properties]
-    [methods (ns $services)]
-    [exec $exec~]
-  ])
-
-  set services[newListClient] = {
-    put ($-run-services-newListClient~ &ctx=$-services &utils=$utils)
-  }
-
-  set services[help] = {
-   $exec~ &raw-flags=['--help']
-  }
-  set services[h] = $services[help]
-
-  var methods = $cli[methods]
-  set methods[services:] = (ns $services)
-  set methods[svc:] = $methods[services:]
-
-  put $methods
+  put $commands 
 }
 
-var providers = (ns (make-map [
-  ['run' $-run~]
-]))
+fn -addProvider {|&ctx=$nil &namespace=[] &provider=[&]|
+  var commands = $ctx[commands]
+
+  if (has-key $provider commands) {
+    each {|command|
+      set commands = ($-addCommand~ &ctx=$ctx &namespace=$namespace &commands=$commands &command=$command)
+    } $provider[commands]
+  }
+
+  if (has-key $provider groups) {
+    each {|group|
+      var groupName = $group[_name_]
+      var groupKey = $groupName':'
+      var -namespace = (conj $namespace $groupName)
+      var -group = ($-addProvider~ &ctx=$ctx &namespace=$-namespace &provider=$group)
+      set commands[$groupKey] = $-group
+    } $provider[groups] 
+  }
+
+  put (ns $commands)
+}
 
 fn newClient {|groupOrCommand|
-  if (not (has-key $providers $groupOrCommand)) { exit 1 }
+
+  var cli-json = (str:join '/' [$runtime:lib-dirs[0] $-cmds-json])
+
+  var namespace = (jq -rcM '._name_' < $cli-json)
+  var groups = (jq -cM '.groups[] | ._name_' < $cli-json | jq -srcM | from-json)
+  var commands = (jq -cM '.commands[] | ._name_' < $cli-json | jq -srcM | from-json)
+
+  var isGroup = (has-value $groups $groupOrCommand)
+  var isCommand = (not (or $isGroup (has-value $commands $groupOrCommand)))
+
+  if (not (or $isCommand $isGroup)) {
+    fail (printf "'%s' is neither a command nor a group" $groupOrCommand | slurp) 
+  }
+
+  var category = (if $isGroup { put 'groups' } else { put 'command' })
+
+  var cli-json-filter-template = '.%s[] | select(.%s=="%s")'
+  var cli-json-filter = (printf $cli-json-filter-template $category '_name_' $groupOrCommand | slurp)
+  var provider = (jq -cM $cli-json-filter < $cli-json | from-json)
 
   var -projectId = (gcloud config get project 2>/dev/null | tr -d '\n' | slurp)
 
@@ -124,7 +214,7 @@ fn newClient {|groupOrCommand|
 
   var exec~ = {|&flags=[] &raw-flags=[] @args|
     var -flags = ($flags~)
-    gcloud $groupOrCommand $@args $@raw-flags $@-flags
+    gcloud $@args $@raw-flags $@-flags $@flags
   }
 
   var setDebug~ = {|&enabled=$false|
@@ -182,18 +272,16 @@ fn newClient {|groupOrCommand|
     ] | to-json
   }
 
-  var cli = (make-map [
+  var ctx = (make-map [
     [properties $properties]
-    [methods $methods]
+    [commands $methods]
     [exec $exec~]
     [utils $utils]
   ])
 
-  set methods = ($providers[$groupOrCommand] &cli=$cli &utils=$utils)
-  set m = $methods
-
-  set api = (ns $methods)
-  put $api
+  var commands = ($-addProvider~ &ctx=$ctx &namespace=[$groupOrCommand] &provider=$provider)
+  set m = $commands
+  put $commands
 }
 
 var -cli = (ns (make-map [      ^
